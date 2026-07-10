@@ -274,6 +274,9 @@ func TranslateAnthropicToCodex(rawJSON []byte, modelMappingJSON string) ([]byte,
 }
 
 func shouldUseCodexPriorityForAnthropicSpeed(speed string) bool {
+	if fastModeDisabled() {
+		return false
+	}
 	return strings.ToLower(strings.TrimSpace(speed)) == "fast"
 }
 
