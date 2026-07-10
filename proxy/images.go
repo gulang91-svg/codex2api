@@ -21,6 +21,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -47,7 +48,8 @@ const (
 	defaultImages4KPortraitSize  = "2160x3840"
 	defaultImages4KSquareSize    = "2880x2880"
 
-	maxGPTImage2Pixels = 8294400
+	minImages2KRequestLongSide = 2048
+	maxGPTImage2Pixels         = 8294400
 
 	// maxImageAttempts caps the total number of upstream attempts for image
 	// generation requests, including retries across different accounts.
@@ -452,6 +454,29 @@ func setDefaultImageToolSize(tool []byte, defaultSize string) []byte {
 	}
 	tool, _ = sjson.SetBytes(tool, "size", defaultSize)
 	return tool
+}
+
+func parseImageSizeLongSide(size string) (int, bool) {
+	raw := strings.TrimSpace(size)
+	if raw == "" || strings.EqualFold(raw, "auto") {
+		return 0, false
+	}
+	parts := strings.Split(strings.ToLower(raw), "x")
+	if len(parts) != 2 {
+		return 0, false
+	}
+	width, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || width <= 0 {
+		return 0, false
+	}
+	height, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || height <= 0 {
+		return 0, false
+	}
+	if height > width {
+		return height, true
+	}
+	return width, true
 }
 
 func shouldValidateGPTImage2Size(model string) bool {
@@ -1404,7 +1429,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
 		} else {
 			var out []byte
-			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor)
+			requestedUpscale := imageAPIUpscaleScale(requestModel, gjson.GetBytes(responsesBody, "tools.0.size").String())
+			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, requestedUpscale, urlFor)
 			if readErr == nil {
 				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
@@ -1554,7 +1580,7 @@ func shouldRetryImageStreamError(err error, generalRetries *int, maxGeneralRetri
 	return true
 }
 
-func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, urlFor imageURLBuilder) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
+func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, fallbackModel string, requestedUpscale string, urlFor imageURLBuilder) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
 	var (
 		out            []byte
 		usage          *UsageInfo
@@ -1600,6 +1626,10 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 				readErr = fmt.Errorf("upstream did not return image output")
 				return false
 			}
+			results = upscaleImageAliasResultsForAPI(ctx, results, fallbackModel, requestedUpscale)
+			if len(results) > 0 {
+				firstMeta = results[0]
+			}
 			out, readErr = buildImagesAPIResponse(ctx, results, createdAt, usageRaw, firstMeta, responseFormat, urlFor)
 			imageLogInfo = imageUsageLogInfoFromImages(results)
 			return false
@@ -1623,6 +1653,10 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 			for i := range pendingResults {
 				mergeImageMeta(&pendingResults[i], firstMeta)
 			}
+			pendingResults = upscaleImageAliasResultsForAPI(ctx, pendingResults, fallbackModel, requestedUpscale)
+			if len(pendingResults) > 0 {
+				firstMeta = pendingResults[0]
+			}
 			out, readErr = buildImagesAPIResponse(ctx, pendingResults, createdAt, nil, firstMeta, responseFormat, urlFor)
 			if readErr != nil {
 				return nil, usage, 0, imageLogInfo, readErr
@@ -1633,6 +1667,106 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 		return nil, usage, 0, imageLogInfo, fmt.Errorf("stream disconnected before image generation completed")
 	}
 	return out, usage, len(gjson.GetBytes(out, "data").Array()), imageLogInfo, nil
+}
+
+func imageAPIUpscaleScale(requestModel string, requestedSize string) string {
+	switch strings.ToLower(strings.TrimSpace(requestModel)) {
+	case imageModel4KAlias:
+		return imageproc.Upscale4K
+	case imageModel2KAlias:
+		return imageproc.Upscale2K
+	}
+	longSide, ok := parseImageSizeLongSide(requestedSize)
+	if !ok {
+		return imageproc.UpscaleNone
+	}
+	if longSide >= imageproc.UpscaleLongSide(imageproc.Upscale4K) {
+		return imageproc.Upscale4K
+	}
+	if longSide >= minImages2KRequestLongSide {
+		return imageproc.Upscale2K
+	}
+	return imageproc.UpscaleNone
+}
+
+func upscaleImageAliasResultsForAPI(ctx context.Context, results []imageCallResult, requestModel string, requestedUpscale string) []imageCallResult {
+	if len(results) == 0 {
+		return results
+	}
+	out := make([]imageCallResult, len(results))
+	copy(out, results)
+	for i := range out {
+		scale := imageproc.NormalizeUpscale(requestedUpscale)
+		if scale == imageproc.UpscaleNone {
+			scale = imageAPIUpscaleScale(requestModel, out[i].Size)
+		}
+		if scale == imageproc.UpscaleNone {
+			continue
+		}
+		target := imageproc.UpscaleLongSide(scale)
+		populateImageStats(&out[i])
+		if out[i].Width >= target || out[i].Height >= target {
+			continue
+		}
+		raw, ok := decodeImageBase64(out[i].Result)
+		if !ok || len(raw) == 0 {
+			continue
+		}
+		upscaled, contentType, ok := upscaleImageBytesForAPI(ctx, raw, scale)
+		if !ok || len(upscaled) == 0 || contentType == "" {
+			continue
+		}
+		out[i].Result = base64.StdEncoding.EncodeToString(upscaled)
+		out[i].OutputFormat = "png"
+		out[i].ByteSize = len(upscaled)
+		if cfg, _, err := image.DecodeConfig(bytes.NewReader(upscaled)); err == nil {
+			out[i].Width = cfg.Width
+			out[i].Height = cfg.Height
+			out[i].Size = fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
+		}
+		log.Printf("[images-api] local_upscale=%s model=%s index=%d bytes=%d->%d size=%dx%d",
+			scale,
+			requestModel,
+			i+1,
+			len(raw),
+			len(upscaled),
+			out[i].Width,
+			out[i].Height,
+		)
+	}
+	return out
+}
+
+func upscaleImageBytesForAPI(ctx context.Context, imageBytes []byte, scale string) ([]byte, string, bool) {
+	scale = imageproc.NormalizeUpscale(scale)
+	if scale == "" || len(imageBytes) == 0 {
+		return nil, "", false
+	}
+	cache := imageproc.GlobalUpscaleCache()
+	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale)
+	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
+		return data, contentType, true
+	}
+	upscaleCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	if err := cache.Acquire(upscaleCtx); err != nil {
+		log.Printf("[images-api] local_upscale_skipped scale=%s error=%s", scale, err.Error())
+		return nil, "", false
+	}
+	defer cache.Release()
+	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
+		return data, contentType, true
+	}
+	upscaled, contentType, err := imageproc.DoUpscale(imageBytes, scale)
+	if err != nil {
+		log.Printf("[images-api] local_upscale_failed scale=%s error=%s", scale, err.Error())
+		return nil, "", false
+	}
+	if contentType == "" {
+		return nil, "", false
+	}
+	cache.Put(key, upscaled, contentType)
+	return upscaled, contentType, true
 }
 
 func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseFormat, streamPrefix, fallbackModel string, start time.Time) (*UsageInfo, int, int, imageUsageLogInfo, error) {
