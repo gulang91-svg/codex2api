@@ -1,9 +1,13 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -20,6 +24,20 @@ import (
 )
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+
+func validTestPNGBase64(width, height int) string {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: 255, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
 
 func TestBuildImagesAPIResponseCloudURL(t *testing.T) {
 	// 用本地 httptest 充当 S3 端点：PUT 返回 200 让上传成功；
@@ -71,6 +89,78 @@ func TestBuildImagesAPIResponseLocalFallsBackToDataURL(t *testing.T) {
 	url := gjson.GetBytes(out, "data.0.url").String()
 	if !strings.HasPrefix(url, "data:image/png;base64,") {
 		t.Fatalf("expected data url fallback for local backend, got %q", url)
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPIUpscales4KAlias(t *testing.T) {
+	src := validTestPNGBase64(16, 16)
+	results := []imageCallResult{{Result: src, OutputFormat: "png", Model: imageModel4KAlias}}
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, imageModel4KAlias, "")
+
+	if len(got) != 1 {
+		t.Fatalf("result count = %d, want 1", len(got))
+	}
+	if got[0].Width != 3840 || got[0].Height != 3840 {
+		t.Fatalf("upscaled dimensions = %dx%d, want 3840x3840", got[0].Width, got[0].Height)
+	}
+	if got[0].OutputFormat != "png" {
+		t.Fatalf("output format = %q, want png", got[0].OutputFormat)
+	}
+	if got[0].Result == src {
+		t.Fatal("expected image payload to be replaced with upscaled image")
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPIUpscales2KAlias(t *testing.T) {
+	src := validTestPNGBase64(16, 16)
+	results := []imageCallResult{{Result: src, OutputFormat: "png", Model: imageModel2KAlias}}
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, imageModel2KAlias, "")
+
+	if got[0].Width != 2560 || got[0].Height != 2560 {
+		t.Fatalf("upscaled dimensions = %dx%d, want 2560x2560", got[0].Width, got[0].Height)
+	}
+	if got[0].Result == src {
+		t.Fatal("expected image payload to be replaced with upscaled image")
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPIUpscalesBaseModelBySize(t *testing.T) {
+	src := validTestPNGBase64(16, 16)
+	results := []imageCallResult{{Result: src, OutputFormat: "png", Model: defaultImagesToolModel, Size: defaultImages4KSize}}
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, defaultImagesToolModel, "")
+
+	if got[0].Width != 3840 || got[0].Height != 3840 {
+		t.Fatalf("upscaled dimensions = %dx%d, want 3840x3840", got[0].Width, got[0].Height)
+	}
+	if got[0].Result == src {
+		t.Fatal("expected image payload to be replaced with upscaled image")
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPIUsesRequestedScale(t *testing.T) {
+	src := validTestPNGBase64(16, 16)
+	results := []imageCallResult{{Result: src, OutputFormat: "png", Model: defaultImagesToolModel}}
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, defaultImagesToolModel, "4k")
+
+	if got[0].Width != 3840 || got[0].Height != 3840 {
+		t.Fatalf("upscaled dimensions = %dx%d, want 3840x3840", got[0].Width, got[0].Height)
+	}
+	if got[0].Result == src {
+		t.Fatal("expected image payload to be replaced with upscaled image")
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPISkipsBaseModel(t *testing.T) {
+	results := []imageCallResult{{Result: tinyPNGBase64, OutputFormat: "png", Model: defaultImagesToolModel}}
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, defaultImagesToolModel, "")
+
+	if got[0].Result != tinyPNGBase64 {
+		t.Fatal("base gpt-image-2 should not be locally upscaled")
 	}
 }
 
@@ -590,7 +680,7 @@ func TestBuildImagesResponsesRequestIncludesEditImages(t *testing.T) {
 func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 	upstream := `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"` + tinyPNGBase64 + `","revised_prompt":"draw a cat","output_format":"png"}]}}` + "\n\n"
 
-	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	out, usage, imageCount, imageLogInfo, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", "", nil)
 	if err != nil {
 		t.Fatalf("collectImagesResponse returned error: %v", err)
 	}
@@ -626,7 +716,7 @@ func TestCollectImagesResponseBuildsOpenAIImagePayload(t *testing.T) {
 func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	upstream := `data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"An error occurred while processing your request. Please include the request ID req-123."}}}` + "\n\n"
 
-	_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", nil)
+	_, _, _, _, err := collectImagesResponse(context.Background(), strings.NewReader(upstream), "b64_json", "gpt-image-2", "", nil)
 	if err == nil {
 		t.Fatal("collectImagesResponse returned nil error")
 	}
