@@ -211,6 +211,27 @@ func TestTranslateAnthropicToCodex_SpeedFastMapsToCodexPriority(t *testing.T) {
 	}
 }
 
+func TestTranslateAnthropicToCodex_DropsSpeedFastWhenDisabled(t *testing.T) {
+	t.Setenv("CODEX_DISABLE_FAST_MODE", "true")
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{"role":"user","content":"hello"}],
+		"speed":"fast"
+	}`)
+
+	got, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+	if err != nil {
+		t.Fatalf("TranslateAnthropicToCodexWithModels returned error: %v", err)
+	}
+
+	if tier := gjson.GetBytes(got, "service_tier"); tier.Exists() {
+		t.Fatalf("disabled fast mode should omit service_tier upstream, got body=%s", got)
+	}
+	if speed := gjson.GetBytes(got, "speed"); speed.Exists() {
+		t.Fatalf("speed should not be forwarded to Codex body; body=%s", got)
+	}
+}
+
 func TestAnthropicUsageServiceTierResolution(t *testing.T) {
 	cases := []struct {
 		name   string
