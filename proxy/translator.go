@@ -2214,6 +2214,9 @@ func isAllowedServiceTier(tier string) bool {
 func upstreamServiceTier(tier string) (string, bool) {
 	switch tier {
 	case "fast", "priority":
+		if fastModeDisabled() {
+			return "", false
+		}
 		return "priority", true
 	case "auto", "default", "flex", "scale":
 		return "", false
@@ -2513,6 +2516,9 @@ func resolveBillingServiceTier(actualTier, requestedTier string) string {
 func resolveBillingServiceTierForPolicy(actualTier, requestedTier, policy string) string {
 	actualTier = normalizeBillingServiceTier(actualTier)
 	requestedTier = normalizeBillingServiceTier(requestedTier)
+	if fastModeDisabled() && requestedTier == "priority" {
+		requestedTier = ""
+	}
 
 	if NormalizeBillingTierPolicy(policy) == BillingTierPolicyRequested {
 		if requestedTier != "" {
