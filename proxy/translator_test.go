@@ -138,6 +138,35 @@ func TestSanitizeServiceTierForUpstream_FastToPriority(t *testing.T) {
 	}
 }
 
+func TestSanitizeServiceTierForUpstream_DropsFastWhenDisabled(t *testing.T) {
+	t.Setenv("CODEX_DISABLE_FAST_MODE", "true")
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"service_tier":"fast",
+		"serviceTier":"fast"
+	}`)
+
+	got := sanitizeServiceTierForUpstream(raw)
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("disabled fast mode should omit service_tier upstream, got body=%s", got)
+	}
+	if gjson.GetBytes(got, "serviceTier").Exists() {
+		t.Fatalf("serviceTier should be removed for upstream, got body=%s", got)
+	}
+}
+
+func TestResolveBillingServiceTierFastDisabledIgnoresRequestedFast(t *testing.T) {
+	t.Setenv("CODEX_DISABLE_FAST_MODE", "true")
+
+	if got := resolveBillingServiceTierForPolicy("default", "fast", BillingTierPolicyRequested); got != "default" {
+		t.Fatalf("requested fast should not bill priority when disabled, got %q", got)
+	}
+	if got := resolveBillingServiceTierForPolicy("", "priority", BillingTierPolicyActual); got != "" {
+		t.Fatalf("requested priority fallback should be ignored when disabled, got %q", got)
+	}
+}
+
 func TestSanitizeServiceTierForUpstream_DropsUnsupportedClientTiers(t *testing.T) {
 	for _, tier := range []string{"auto", "default", "flex", "scale"} {
 		t.Run(tier, func(t *testing.T) {
@@ -180,6 +209,24 @@ func TestTranslateRequest_PreservesSupportedServiceTier(t *testing.T) {
 	}
 	if effort := gjson.GetBytes(got, "reasoning.effort").String(); effort != "high" {
 		t.Fatalf("reasoning.effort mismatch: got %q want %q", effort, "high")
+	}
+}
+
+func TestTranslateRequest_DropsFastServiceTierWhenDisabled(t *testing.T) {
+	t.Setenv("CODEX_DISABLE_FAST_MODE", "true")
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"messages":[{"role":"user","content":"hello"}],
+		"serviceTier":"priority"
+	}`)
+
+	got, err := TranslateRequest(raw)
+	if err != nil {
+		t.Fatalf("TranslateRequest returned error: %v", err)
+	}
+
+	if gjson.GetBytes(got, "service_tier").Exists() {
+		t.Fatalf("disabled fast mode should omit service_tier upstream, got body=%s", got)
 	}
 }
 
