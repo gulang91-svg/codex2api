@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,20 @@ func validTestPNGBase64(width, height int) string {
 	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
+		panic(err)
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func validTestJPEGBase64(width, height int) string {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.Set(x, y, color.RGBA{R: 32, G: 96, B: 192, A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err != nil {
 		panic(err)
 	}
 	return base64.StdEncoding.EncodeToString(buf.Bytes())
@@ -151,6 +166,30 @@ func TestUpscaleImageAliasResultsForAPIUsesRequestedScale(t *testing.T) {
 	}
 	if got[0].Result == src {
 		t.Fatal("expected image payload to be replaced with upscaled image")
+	}
+}
+
+func TestImageAPIUpscaleScaleRecognizes4KPortraitRequest(t *testing.T) {
+	if got := imageAPIUpscaleScale(defaultImagesToolModel, "2160x3840"); got != "4k" {
+		t.Fatalf("imageAPIUpscaleScale() = %q, want 4k", got)
+	}
+}
+
+func TestUpscaleImageAliasResultsForAPIUpscalesJPEGFrom4KRequest(t *testing.T) {
+	src := validTestJPEGBase64(16, 24)
+	results := []imageCallResult{{Result: src, OutputFormat: "jpeg", Model: defaultImagesToolModel, Size: "1024x1536"}}
+	requestedScale := imageAPIUpscaleScale(defaultImagesToolModel, "2160x3840")
+
+	got := upscaleImageAliasResultsForAPI(context.Background(), results, defaultImagesToolModel, requestedScale)
+
+	if got[0].Width != 2560 || got[0].Height != 3840 {
+		t.Fatalf("upscaled dimensions = %dx%d, want 2560x3840", got[0].Width, got[0].Height)
+	}
+	if got[0].OutputFormat != "png" {
+		t.Fatalf("output format = %q, want png", got[0].OutputFormat)
+	}
+	if got[0].Result == src {
+		t.Fatal("expected JPEG payload to be replaced with upscaled PNG")
 	}
 }
 
