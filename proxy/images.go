@@ -394,6 +394,20 @@ func normalizeImageToolModelForPrompt(model string, prompt string) (string, stri
 	}
 }
 
+func imageToolSupportsInputFidelity(model string) bool {
+	model = strings.ToLower(strings.TrimSpace(model))
+	return !strings.HasPrefix(model, "gpt-image-2")
+}
+
+func setImageToolInputFidelity(tool []byte, model string, value string) []byte {
+	value = strings.TrimSpace(value)
+	if value == "" || !imageToolSupportsInputFidelity(model) {
+		return tool
+	}
+	tool, _ = sjson.SetBytes(tool, "input_fidelity", value)
+	return tool
+}
+
 func inferDefaultImageSize(prompt string, sizes imageDefaultSizeSet) string {
 	switch inferImageAspectFromPrompt(prompt) {
 	case "square":
@@ -1211,11 +1225,12 @@ func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string)
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, strings.TrimSpace(c.PostForm("prompt")))
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
-	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
+	for _, field := range []string{"size", "quality", "background", "output_format", "moderation"} {
 		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
 			tool, _ = sjson.SetBytes(tool, field, value)
 		}
 	}
+	tool = setImageToolInputFidelity(tool, toolModel, c.PostForm("input_fidelity"))
 	for _, field := range []string{"output_compression", "partial_images"} {
 		if value := strings.TrimSpace(c.PostForm(field)); value != "" {
 			tool, _ = sjson.SetBytes(tool, field, parseIntField(value, 0))
@@ -1317,11 +1332,12 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
-	for _, field := range []string{"size", "quality", "background", "output_format", "input_fidelity", "moderation"} {
+	for _, field := range []string{"size", "quality", "background", "output_format", "moderation"} {
 		if value := strings.TrimSpace(gjson.GetBytes(rawBody, field).String()); value != "" {
 			tool, _ = sjson.SetBytes(tool, field, value)
 		}
 	}
+	tool = setImageToolInputFidelity(tool, toolModel, gjson.GetBytes(rawBody, "input_fidelity").String())
 	for _, field := range []string{"output_compression", "partial_images"} {
 		if value := gjson.GetBytes(rawBody, field); value.Exists() && value.Type == gjson.Number {
 			tool, _ = sjson.SetBytes(tool, field, value.Int())
