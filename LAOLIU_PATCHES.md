@@ -30,6 +30,12 @@ For non-streaming `/v1/images/generations` and `/v1/images/edits` responses:
 
 The implementation reuses `internal/imageproc` and its bounded global cache.
 
+### Per-account concurrency ceiling
+
+The global, per-account, batch-account, and account-group base concurrency
+settings accept values from 1 through 200. Backend validation, frontend input
+validation, and pool runway estimates use the same ceiling.
+
 ### Verification
 
 ```sh

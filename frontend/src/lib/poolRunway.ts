@@ -8,6 +8,7 @@
  */
 
 import type { AccountRow } from '../types'
+import { MAX_ACCOUNT_CONCURRENCY } from './accountConcurrency'
 
 export type RecoveryWindow = '5h' | '7d'
 export type RiskLevel = 'low' | 'medium' | 'high'
@@ -420,7 +421,7 @@ function getEffectiveConcurrency(account: AccountRow): number {
     account.base_concurrency_effective ??
     account.base_concurrency_override ??
     1
-  return clamp(normalizeNumber(value), 1, 50)
+  return clamp(normalizeNumber(value), 1, MAX_ACCOUNT_CONCURRENCY)
 }
 
 function getRpmPerSlot(avgDurationMs: number): number {
