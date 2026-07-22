@@ -592,6 +592,21 @@ func TestNormalizeImageToolModelAliases(t *testing.T) {
 	}
 }
 
+func TestSetImageToolInputFidelitySkipsGPTImage2Family(t *testing.T) {
+	base := []byte(`{"type":"image_generation","model":"gpt-image-2"}`)
+	for _, model := range []string{"gpt-image-2", "gpt-image-2-2k", "gpt-image-2-4k", "gpt-image-2-codex"} {
+		got := setImageToolInputFidelity(base, model, "high")
+		if value := gjson.GetBytes(got, "input_fidelity"); value.Exists() {
+			t.Fatalf("model %q unexpectedly forwarded input_fidelity: %s", model, got)
+		}
+	}
+
+	got := setImageToolInputFidelity(base, "gpt-image-1.5", "high")
+	if value := gjson.GetBytes(got, "input_fidelity").String(); value != "high" {
+		t.Fatalf("gpt-image-1.5 input_fidelity = %q, want high; body=%s", value, got)
+	}
+}
+
 func TestNormalizeImageToolModelForPromptInfersAspect(t *testing.T) {
 	tests := []struct {
 		name     string
