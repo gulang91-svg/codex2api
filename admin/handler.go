@@ -1237,7 +1237,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, 50)
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, maxAccountConcurrency)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -7399,8 +7399,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		if v < 1 {
 			v = 1
 		}
-		if v > 50 {
-			v = 50
+		if v > maxAccountConcurrency {
+			v = maxAccountConcurrency
 		}
 		h.store.SetMaxConcurrency(v)
 		log.Printf("设置已更新: max_concurrency = %d", v)

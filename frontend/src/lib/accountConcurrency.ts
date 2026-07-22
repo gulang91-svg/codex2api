@@ -1,0 +1,1 @@
+export const MAX_ACCOUNT_CONCURRENCY = 200

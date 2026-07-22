@@ -129,7 +129,7 @@ func TestAccountGroupBaseConcurrencyOverrideAPIThreeState(t *testing.T) {
 
 	for _, body := range []string{
 		`{"base_concurrency_override":0}`,
-		`{"base_concurrency_override":51}`,
+		`{"base_concurrency_override":201}`,
 		`{"base_concurrency_override":"2"}`,
 	} {
 		recorder = patch(body)
@@ -176,12 +176,25 @@ func TestAccountGroupBaseConcurrencyOverrideAPIThreeState(t *testing.T) {
 	}
 }
 
+func TestAccountGroupBaseConcurrencyOverrideAcceptsTwoHundred(t *testing.T) {
+	got, err := parseAccountGroupBaseConcurrencyOverride(json.RawMessage(`200`))
+	if err != nil {
+		t.Fatalf("parse 200: %v", err)
+	}
+	if !got.Set || !got.Value.Valid || got.Value.Int64 != 200 {
+		t.Fatalf("parse 200 = %+v, want valid 200", got)
+	}
+	if _, err := parseAccountGroupBaseConcurrencyOverride(json.RawMessage(`201`)); err == nil {
+		t.Fatal("parse 201 succeeded, want range error")
+	}
+}
+
 func TestCreateAccountGroupRejectsInvalidBaseConcurrencyOverride(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := &Handler{db: newTestAdminDB(t)}
 	for _, body := range []string{
 		`{"name":"zero","base_concurrency_override":0}`,
-		`{"name":"large","base_concurrency_override":51}`,
+		`{"name":"large","base_concurrency_override":201}`,
 		`{"name":"fraction","base_concurrency_override":1.5}`,
 	} {
 		recorder := invokeAccountGroupHandler(t, http.MethodPost, "/api/admin/account-groups", nil, body, handler.CreateAccountGroup)

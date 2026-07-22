@@ -11,6 +11,7 @@ import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '..
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import { MAX_ACCOUNT_CONCURRENCY } from '../lib/accountConcurrency'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -1897,7 +1898,7 @@ export default function Settings() {
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')} suffix={t('settings.unit.concurrency')}>
                   <DraftNumberInput
                     min={1}
-                    max={50}
+                    max={MAX_ACCOUNT_CONCURRENCY}
                     value={settingsForm.max_concurrency}
                     onValueChange={(value) => setSettingsForm(f => ({ ...f, max_concurrency: value }))}
                   />

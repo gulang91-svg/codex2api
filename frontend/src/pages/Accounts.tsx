@@ -40,6 +40,7 @@ import type {
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import { MAX_ACCOUNT_CONCURRENCY } from "../lib/accountConcurrency";
 import {
   formatLongUsageWindowLabel,
   needsUsageReload,
@@ -3520,7 +3521,7 @@ export default function Accounts() {
     batchBaseConcurrencyTrimmed !== "" &&
     (batchBaseConcurrencyValue === null ||
       batchBaseConcurrencyValue < 1 ||
-      batchBaseConcurrencyValue > 50);
+      batchBaseConcurrencyValue > MAX_ACCOUNT_CONCURRENCY);
   const batchSchedulerPriorityInvalid =
     batchUpdateSchedulerPriority &&
     isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
@@ -3861,7 +3862,7 @@ export default function Accounts() {
     concurrencyMode === "custom" &&
     (parsedBaseConcurrency === null ||
       parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+      parsedBaseConcurrency > MAX_ACCOUNT_CONCURRENCY);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -4021,7 +4022,7 @@ export default function Accounts() {
     groupDraft.baseConcurrencyInput.trim() !== "" &&
     (parsedGroupBaseConcurrency === null ||
       parsedGroupBaseConcurrency < 1 ||
-      parsedGroupBaseConcurrency > 50);
+      parsedGroupBaseConcurrency > MAX_ACCOUNT_CONCURRENCY);
 
   const resetGroupDraft = () => {
     setGroupDraft({
@@ -8537,7 +8538,7 @@ export default function Accounts() {
                     <Input
                       type="number"
                       min={1}
-                      max={50}
+                      max={MAX_ACCOUNT_CONCURRENCY}
                       step={1}
                       inputMode="numeric"
                       value={groupDraft.baseConcurrencyInput}
