@@ -54,6 +54,8 @@ type Handler struct {
 	apiKeyGateMu sync.Mutex
 	promptRiskMu sync.Mutex
 	apiKeyGate   *apiKeyConcurrencyLimiter
+	scopeUsageMu sync.Mutex
+	scopeUsage   *apiKeyScopeUsageTracker
 }
 
 const (
@@ -177,6 +179,9 @@ const (
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
 	contextAPIKeyRow    = "apiKeyRow"
+	// contextScopeBudgetGate 存放本次请求的 scope 预算闸门（issue #439），
+	// 由 enforceAPIKeyLimits 计算一次，供账号过滤链与「无可用账号」分支复用。
+	contextScopeBudgetGate = "apiKeyScopeBudgetGate"
 )
 
 func requestAPIKeyID(c *gin.Context) int64 {
@@ -325,13 +330,31 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
-			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
+			return relayAccountSupportsModel(account, routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
 		}
 		if !allowCodexAccounts {
 			return false
 		}
 		return codexFilter(account)
 	}
+}
+
+// relayAccountSupportsModel 判断 relay 风格账号能否服务指定模型。
+// 普通 relay 中转必须显式声明 models 白名单；Grok 账号未声明白名单时按默认
+// Grok 模型集放行——与 /v1/models 的默认集注册（supportedModelIDs）保持一致，
+// 否则通用 Key 在模型列表里看得到 grok-4.5 却永远调度不到（恒 503）。
+// 声明了白名单的 Grok 账号仍以白名单为准。
+func relayAccountSupportsModel(account *auth.Account, model string) bool {
+	if account == nil {
+		return false
+	}
+	if account.SupportsOpenAIResponsesModel(model) {
+		return true
+	}
+	if !account.IsGrokAPI() || len(account.GrokModels()) > 0 {
+		return false
+	}
+	return modelIDInList(model, DefaultGrokModelIDs())
 }
 
 func modelIDInList(model string, models []string) bool {
@@ -357,7 +380,7 @@ func (h *Handler) modelSupportedByAccountMapping(model string) bool {
 			continue
 		}
 		mappedModel, ok := resolveAccountModelMapping(account, model)
-		if ok && mappedModel != "" && account.SupportsOpenAIResponsesModel(mappedModel) {
+		if ok && mappedModel != "" && relayAccountSupportsModel(account, mappedModel) {
 			return true
 		}
 	}
@@ -663,6 +686,8 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	if h.db == nil || input == nil {
 		return
 	}
+	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
+	h.recordAPIKeyScopeUsage(input)
 	// 渠道在写入时按调度账号固化（内存索引查询），供仪表盘分渠道聚合；
 	// 账号已不在池中（如刚被删除）时按 codex 兜底。
 	if input.Channel == "" && h.store != nil {
@@ -855,6 +880,31 @@ func readRawRequestBody(c *gin.Context) ([]byte, error) {
 	}
 	setRawRequestBody(c, body)
 	return body, nil
+}
+
+const ingressRequestBodyContextKey = "ingress_raw_body"
+
+func setIngressRequestBodyIfAbsent(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+	if _, exists := c.Get(ingressRequestBodyContextKey); exists {
+		return
+	}
+	// The request-size middleware already owns this immutable buffer for the
+	// request lifetime. Retain the same slice instead of copying the full body.
+	c.Set(ingressRequestBodyContextKey, body)
+}
+
+func ingressRequestBody(c *gin.Context, fallback []byte) []byte {
+	if c != nil {
+		if value, exists := c.Get(ingressRequestBodyContextKey); exists {
+			if body, ok := value.([]byte); ok {
+				return body
+			}
+		}
+	}
+	return fallback
 }
 
 func setRawRequestBody(c *gin.Context, body []byte) {
@@ -1455,6 +1505,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
 	v1.GET("/responses", h.ResponsesWebSocket)
+	v1.GET("/realtime", h.RealtimeWebSocket)
 	v1.POST("/responses/compact", h.ResponsesCompact)
 	v1.POST("/images/generations", h.ImagesGenerations)
 	v1.POST("/images/edits", h.ImagesEdits)
@@ -1472,6 +1523,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/chat/completions", auth, h.ChatCompletions)
 	r.POST("/responses", auth, h.Responses)
 	r.GET("/responses", auth, h.ResponsesWebSocket)
+	r.GET("/realtime", auth, h.RealtimeWebSocket)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
 	r.POST("/images/generations", auth, h.ImagesGenerations)
 	r.POST("/images/edits", auth, h.ImagesEdits)
@@ -1532,6 +1584,16 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		}
 
 		authHeader := c.GetHeader("Authorization")
+		// OpenAI-compatible WebSocket clients may carry the API key in the
+		// standard subprotocol list instead of an Authorization header:
+		//   Sec-WebSocket-Protocol: realtime, openai-insecure-api-key.<key>
+		// Only honor it on an actual WebSocket upgrade so an ordinary HTTP
+		// request cannot smuggle authentication through an unrelated header.
+		if authHeader == "" && isResponsesWebSocketUpgradeRequest(c.Request) {
+			if key := apiKeyFromWebSocketSubprotocol(c.GetHeader("Sec-WebSocket-Protocol")); key != "" {
+				authHeader = "Bearer " + key
+			}
+		}
 		// 兼容 Anthropic 客户端的多种认证方式:
 		// - x-api-key: Anthropic SDK 默认方式
 		// - ANTHROPIC_AUTH_TOKEN: Claude Code 通过此环境变量设置，
@@ -1597,6 +1659,17 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 	}
 }
 
+func apiKeyFromWebSocketSubprotocol(header string) string {
+	for _, item := range strings.Split(header, ",") {
+		item = strings.TrimSpace(item)
+		const prefix = "openai-insecure-api-key."
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimSpace(strings.TrimPrefix(item, prefix))
+		}
+	}
+	return ""
+}
+
 // ==================== /v1/responses ====================
 
 // getMaxRetries 从 store 读取可配置的最大重试次数
@@ -1609,6 +1682,18 @@ func (h *Handler) getMaxRateLimitRetries() int {
 		return 1
 	}
 	return h.store.GetMaxRateLimitRetries()
+}
+
+// effectiveMaxRateLimitRetries 返回当前账号适用的限流(429)换号重试上限：Grok 账号可在
+// grok 系统设置里配置专属次数(free 号限流频繁，换号重试更易成功)；未配置(0)或非 Grok
+// 账号回落到全局 max_rate_limit_retries。按当前 attempt 的账号动态取值。
+func (h *Handler) effectiveMaxRateLimitRetries(account *auth.Account, fallback int) int {
+	if account != nil && account.IsGrokAPI() && h.store != nil {
+		if n := h.store.GrokMaxRateLimitRetries(); n > 0 {
+			return n
+		}
+	}
+	return fallback
 }
 
 const (
@@ -1705,6 +1790,16 @@ func IsDeactivatedWorkspaceError(body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "deactivated_workspace")
 }
 
+// IsAgentRuntimeDeletedError 判断响应体是否表示 Agent runtime 已删除。
+func IsAgentRuntimeDeletedError(body []byte) bool {
+	code := strings.ToLower(firstGJSONString(body, "error.code", "detail.code", "code"))
+	if code != "biscuit_baker_service_agent_error_status" {
+		return false
+	}
+	message := strings.ToLower(firstGJSONString(body, "error.message", "detail.message", "message"))
+	return strings.Contains(message, "agent runtime has been deleted")
+}
+
 func upstreamAccountErrorMessage(statusCode int, body []byte) string {
 	if IsDeactivatedWorkspaceError(body) {
 		return fmt.Sprintf("上游返回 %d: deactivated_workspace", statusCode)
@@ -1741,6 +1836,9 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
+			return "agent_runtime_deleted"
+		}
 		if IsDeactivatedWorkspaceError(body) {
 			return "deactivated_workspace"
 		}
@@ -1804,6 +1902,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	bodyReadDone := time.Now()
 	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
 	setRawRequestBody(c, rawBody)
@@ -1944,6 +2043,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1977,6 +2079,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
+			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
@@ -1984,6 +2091,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		if attempt == 0 {
 			emitResponsesPhaseTimings(c, logModel, len(rawBody), handlerStart, bodyReadDone, validateDone, prepareDone)
 		}
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -2156,7 +2264,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2232,7 +2340,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.Release(account)
 					return
 				}
-				streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+				streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
@@ -2564,7 +2672,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2629,6 +2737,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
+		var streamedOutputItems []json.RawMessage
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -2647,12 +2756,15 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
 			var pendingFirstTokenEvents bytes.Buffer
+			// 前置元数据事件立即透传（旧版兼容，issue #425）：每个 attempt 取一次快照，
+			// 热更新对新请求生效，流转发中途不切换缓冲策略。
+			preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 			forward := func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -2678,6 +2790,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
+				if eventType == "response.output_item.done" {
+					item := parsed.Get("item")
+					if isCodexToolCallContextType(item.Get("type").String()) {
+						streamedOutputItems = append(streamedOutputItems, json.RawMessage(item.Raw))
+					}
+				}
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
@@ -2686,7 +2804,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, streamedOutputItems)
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -2712,8 +2830,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					// 事件一样延迟到首 token 一起冲刷：立即写出会提交 200 header 并置位
 					// wroteAnyBody，使首 token 前的 response.failed（如 context_length_exceeded）
 					// 既无法按真实错误码返回，也无法走超窗压缩重试。
-					shouldDefer := !contentTokenSeen && !gotTerminal &&
-						(isPreContentLifecycleEvent(eventType) || isCodexPreflightSSEEvent(eventType))
+					// preflightPassthrough（issue #425）恢复旧版语义：元数据事件立即下发，
+					// 管理员显式接受上述代价；生命周期事件（created/in_progress）不受开关影响。
+					shouldDefer := shouldDeferPreContentSSEEvent(eventType, contentTokenSeen, gotTerminal, preflightPassthrough)
 					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
 					if err != nil {
 						writeErr = err
@@ -2824,7 +2943,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						actualServiceTier = tier
 					}
 					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), data, outputItems)
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -3015,6 +3134,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
 	setRawRequestBody(c, rawBody)
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3113,6 +3233,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
 	openAIResponsesBody := PrepareOpenAIResponsesCompactBody(rawBody)
@@ -3136,11 +3259,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
@@ -3221,7 +3349,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3411,7 +3539,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3545,6 +3673,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
 	setRawRequestBody(c, rawBody)
+	h.capturePromptRequestIngress(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
@@ -3631,6 +3760,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
+	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -3665,10 +3797,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			// 候选被 scope 预算剔空时给出真实原因，而不是含糊的「无可用账号」。
+			if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+				SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+				return
+			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		if !retainedHTTPFallback {
@@ -3834,7 +3972,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3915,7 +4053,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+			streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 
 			// clientGone：客户端写失败后置位，后续事件不再写客户端，
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
@@ -4200,7 +4338,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 		return
 	}
 
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	err := ReadSSEStream(body, func(data []byte) bool {
 		chunk, done := TranslateStreamChunk(data, model, chunkID, created)
 		if chunk != nil {
@@ -4568,6 +4706,12 @@ func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duratio
 
 // Apply429Cooldown 统一处理 429 对账号状态的影响。
 func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response, model string) codex429Decision {
+	// Grok 上游的 429 语义（免费额度耗尽/超支限制/Retry-After）与 Codex 不同，且需要落
+	// grok_free_quota 权威快照——批量测试/连通性测试也走这里，必须同样路由到 Grok 专用映射，
+	// 否则免费额度耗尽会被误标 rate_limited 且丢失用量快照。
+	if account != nil && account.IsGrokAPI() {
+		return applyGrokCooldown(store, account, http.StatusTooManyRequests, body, resp, model)
+	}
 	decision := classify429RateLimit(account, body, resp, time.Now(), model)
 	if store == nil || account == nil {
 		return decision
@@ -4652,6 +4796,13 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if statusCode == http.StatusForbidden && IsAgentRuntimeDeletedError(body) {
+			atomic.StoreInt32(&account.Disabled, 1)
+			errorMsg := upstreamAccountErrorMessage(statusCode, body)
+			log.Printf("账号 %d 的 Agent runtime 已删除，标记为封禁", account.ID())
+			h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
+			return codex429Decision{}
+		}
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
 			if h.store != nil {
@@ -5023,7 +5174,13 @@ func (h *Handler) supportedModelIDs(ctx context.Context) []string {
 	}
 	if h != nil && h.store != nil {
 		for _, account := range h.store.Accounts() {
-			for _, model := range account.OpenAIResponsesModels() {
+			declared := account.OpenAIResponsesModels()
+			// 未声明 models 白名单的 Grok 账号：补默认 Grok 模型集，让 grok-4.5 等
+			// 出现在 /v1/models（否则下游客户端拉不到可用的 Grok 模型名）。
+			if len(declared) == 0 && account.IsGrokAPI() {
+				declared = DefaultGrokModelIDs()
+			}
+			for _, model := range declared {
 				key := strings.ToLower(strings.TrimSpace(model))
 				if key == "" {
 					continue

@@ -3,6 +3,8 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } fr
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate } from "react-router-dom";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
+import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import Modal from "../components/Modal";
 import ChannelLogo from "../components/ChannelLogo";
 import ModelLogo from "../components/ModelLogo";
@@ -81,6 +83,7 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Layers,
   Cloud,
   Lock,
   Unlock,
@@ -119,6 +122,7 @@ import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   accountMatchesGroupFilter,
@@ -760,7 +764,7 @@ export default function Accounts() {
     "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
   const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | "schedulerPriority" | null
+    "requests" | "usage" | "importTime" | "schedulerPriority" | "group" | null
   >(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -830,6 +834,23 @@ export default function Accounts() {
   const [editProxyUrl, setEditProxyUrl] = useState("");
   const [editCustomHeadersText, setEditCustomHeadersText] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
+  // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
+  // （选择器为空时自动隐藏，不影响手动填代理）。
+  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listProxies()
+      .then((res) => {
+        if (!cancelled) setProxyPool(res.proxies ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setProxyPool([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [editOpenAIForm, setEditOpenAIForm] =
     useState<UpdateOpenAIResponsesAccountRequest>({
       name: "",
@@ -972,6 +993,12 @@ export default function Accounts() {
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
+  const {
+    groupIds: importGroupIds,
+    setGroupIds: setImportGroupIds,
+    prune: pruneImportGroupIds,
+  } = useImportGroupIds();
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
     id: null,
@@ -1095,13 +1122,15 @@ export default function Accounts() {
   }) => {
     const isTesting = testingProxyKey === testKey;
     const testDisabled = disabled || !value.trim() || testingProxyKey !== null;
+    const hasProxyPool = proxyPool.length > 0;
 
     return (
-      <div>
-        <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+      <div className="space-y-2.5">
+        <label className="block text-sm font-semibold text-muted-foreground">
           {label}
         </label>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        {/* 第一行：手动填写代理 URL + 测试 */}
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
           <Input
             className="min-w-0 flex-1"
             placeholder={placeholder}
@@ -1122,6 +1151,15 @@ export default function Accounts() {
             {isTesting ? t("accounts.testingProxy") : t("accounts.testProxy")}
           </Button>
         </div>
+        {/* 第二行：从代理池选择（有池条目时单独占一行，与上方 URL 输入左对齐） */}
+        {hasProxyPool ? (
+          <ProxyPoolSelect
+            className="w-full"
+            proxies={proxyPool}
+            disabled={disabled}
+            onSelect={onChange}
+          />
+        ) : null}
       </div>
     );
   };
@@ -1478,7 +1516,8 @@ export default function Accounts() {
       healthBars,
     ] =
       await Promise.all([
-        api.getAccounts(),
+        // Codex 页只拉非 Grok 账号，与 Grok 页 channel=grok 对称，减少大号池传输。
+        api.getAccounts({ channel: "codex" }),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -1568,7 +1607,8 @@ export default function Accounts() {
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
-  }, [allGroups]);
+    pruneImportGroupIds(allGroups);
+  }, [allGroups, pruneImportGroupIds]);
 
   useEffect(() => {
     const missingUsageIds = accounts
@@ -1792,10 +1832,18 @@ export default function Accounts() {
       } else if (sortKey === "schedulerPriority") {
         diff = getSchedulerPriority(a) - getSchedulerPriority(b);
         if (diff === 0) return a.id - b.id;
+      } else if (sortKey === "group") {
+        const aMeta = getAccountGroupSortMeta(a, allGroups);
+        const bMeta = getAccountGroupSortMeta(b, allGroups);
+        diff = aMeta.order - bMeta.order;
+        if (diff === 0) {
+          diff = aMeta.key.localeCompare(bMeta.key, "zh");
+        }
+        if (diff === 0) return a.id - b.id;
       }
       return sortDir === "asc" ? diff : -diff;
     });
-  }, [filteredAccounts, sortDir, sortKey]);
+  }, [allGroups, filteredAccounts, sortDir, sortKey]);
 
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -1925,12 +1973,14 @@ export default function Accounts() {
             refresh_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           }
         : {
             ...addForm,
             session_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           };
     if (
       !payload.refresh_token?.trim() &&
@@ -1988,6 +2038,7 @@ export default function Accounts() {
         ...atForm,
         allow_duplicate: allowDuplicate,
         custom_headers: parsedCustomHeaders.value,
+        group_ids: importGroupIds,
       });
       setShowAdd(false);
       await readImportSSE(res);
@@ -2547,6 +2598,9 @@ export default function Accounts() {
         );
       }
       if (allowDuplicate) formData.append("allow_duplicate", "true");
+      if (importGroupIds.length > 0) {
+        formData.append("group_ids", JSON.stringify(importGroupIds));
+      }
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -4015,6 +4069,29 @@ export default function Accounts() {
     setAllGroups(res.groups ?? []);
   };
 
+  /** Inline create from multi-select (batch / quick / account editor). Returns new group id. */
+  const handleCreateGroupInline = async (
+    name: string,
+  ): Promise<number | null> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showToast(t("accounts.groupNameRequired"), "error");
+      return null;
+    }
+    try {
+      const res = await api.createAccountGroup({
+        name: trimmed,
+        color: ACCOUNT_GROUP_COLORS[allGroups.length % ACCOUNT_GROUP_COLORS.length],
+      });
+      await reloadGroups();
+      showToast(t("accounts.groupCreated"));
+      return res.id;
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+      return null;
+    }
+  };
+
   const parsedGroupBaseConcurrency = parseIntegerInput(
     groupDraft.baseConcurrencyInput,
   );
@@ -4737,6 +4814,35 @@ export default function Accounts() {
                   variant="outline"
                   size="sm"
                   className="min-w-0"
+                  aria-pressed={sortKey === "group"}
+                  title={t("accounts.groupSortHint")}
+                  onClick={() => {
+                    if (sortKey === "group") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("group");
+                      setSortDir("asc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <Layers className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.groupSort")}
+                  </span>
+                  {sortKey === "group" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
                   aria-pressed={sortKey === "schedulerPriority"}
                   title={t("accounts.schedulerPrioritySortHint")}
                   onClick={() => {
@@ -5196,8 +5302,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.groups && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.groupsLabel")}
+                          <TableHead
+                            className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                            onClick={() => {
+                              if (sortKey === "group") {
+                                setSortDir((current) =>
+                                  current === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("group");
+                                setSortDir("asc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.groupsLabel")}{" "}
+                            {sortKey === "group"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.priority && (
@@ -6495,6 +6619,35 @@ export default function Accounts() {
                 )}
               </div>
             )}
+            {(addMethod === "rt" ||
+              addMethod === "st" ||
+              addMethod === "at") && (
+              <div className="mt-4 space-y-1.5 border-t border-border pt-4">
+                <label className="text-sm font-semibold text-muted-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
+            )}
           </Modal>
 
           <Modal
@@ -6530,6 +6683,31 @@ export default function Accounts() {
                 />
                 {t("accounts.allowDuplicate")}
               </label>
+              <div className="space-y-1.5 pt-1">
+                <label className="text-xs font-medium text-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -7632,7 +7810,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
                         </div>
@@ -7659,7 +7837,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         {renderProxyInput({
                           value: editProxyUrl,
                           testKey: "edit-account-proxy",
@@ -7724,6 +7902,11 @@ export default function Accounts() {
                             placeholder={t("accounts.groupsPlaceholder")}
                             emptyLabel={t("accounts.groupsNone")}
                             emptyHint={t("accounts.groupsSelectHint")}
+                            onCreateGroup={handleCreateGroupInline}
+                            createLabel={t("accounts.groupCreate")}
+                            createPlaceholder={t("accounts.groupNamePlaceholder")}
+                            creatingLabel={t("accounts.groupCreating")}
+                            createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                           />
                         </div>
                       </div>
@@ -7805,6 +7988,18 @@ export default function Accounts() {
                 </div>
                 <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
               </div>
+              <div className="flex items-center justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => setShowGroupManager(true)}
+                >
+                  <FolderOpen className="size-3" />
+                  {t("accounts.groupManage")}
+                </Button>
+              </div>
               <AccountGroupMultiSelect
                 groups={allGroups}
                 value={quickGroupIds}
@@ -7817,6 +8012,11 @@ export default function Accounts() {
                 emptyLabel={t("accounts.groupsNone")}
                 emptyHint={t("accounts.groupsSelectHint")}
                 disabled={quickGroupSubmitting}
+                onCreateGroup={handleCreateGroupInline}
+                createLabel={t("accounts.groupCreate")}
+                createPlaceholder={t("accounts.groupNamePlaceholder")}
+                creatingLabel={t("accounts.groupCreating")}
+                createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
               />
             </div>
           </Modal>
@@ -8182,22 +8382,35 @@ export default function Accounts() {
                       )}
                     </div>
                   </div>
-                  {batchMetaMode === "all" ? (
-                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
-                      <span>
-                        {t(
-                          batchUpdateGroups
-                            ? "common.enabled"
-                            : "common.disabled",
-                        )}
-                      </span>
-                      <Switch
-                        checked={batchUpdateGroups}
-                        onCheckedChange={setBatchUpdateGroups}
-                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
-                      />
-                    </label>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {batchUpdateGroups ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => setShowGroupManager(true)}
+                      >
+                        <FolderOpen className="size-3" />
+                        {t("accounts.groupManage")}
+                      </Button>
+                    ) : null}
+                    {batchMetaMode === "all" ? (
+                      <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                        <span>
+                          {t(
+                            batchUpdateGroups
+                              ? "common.enabled"
+                              : "common.disabled",
+                          )}
+                        </span>
+                        <Switch
+                          checked={batchUpdateGroups}
+                          onCheckedChange={setBatchUpdateGroups}
+                          aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
@@ -8224,6 +8437,13 @@ export default function Accounts() {
                         : "accounts.batchMetaFieldHint",
                     )}
                     disabled={!batchUpdateGroups}
+                    onCreateGroup={
+                      batchUpdateGroups ? handleCreateGroupInline : undefined
+                    }
+                    createLabel={t("accounts.groupCreate")}
+                    createPlaceholder={t("accounts.groupNamePlaceholder")}
+                    creatingLabel={t("accounts.groupCreating")}
+                    createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                   />
                 </div>
               </div>
@@ -11172,6 +11392,26 @@ function resolveAccountGroups(
   if (ids.length === 0 || groups.length === 0) return [];
   const byID = new Map(groups.map((group) => [group.id, group]));
   return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
+}
+
+/** Sort key for clustering accounts that share the same group membership. */
+function getAccountGroupSortMeta(
+  account: { group_ids?: number[] | null },
+  groups: AccountGroup[],
+): { order: number; key: string } {
+  const resolved = resolveAccountGroups(account.group_ids ?? [], groups);
+  if (resolved.length === 0) {
+    // Ungrouped accounts sort after every named group in ascending order.
+    return { order: Number.MAX_SAFE_INTEGER, key: "" };
+  }
+  const sorted = [...resolved].sort((a, b) => {
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+    return a.name.localeCompare(b.name, "zh");
+  });
+  return {
+    order: sorted[0].sort_order,
+    key: sorted.map((group) => group.name).join("\0"),
+  };
 }
 
 function GroupChipList({

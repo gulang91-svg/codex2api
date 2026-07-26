@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -29,6 +30,9 @@ type addGrokAccountReq struct {
 	Models       []string `json:"models"`
 	ModelMapping string   `json:"model_mapping"`
 	ProxyURL     string   `json:"proxy_url"`
+	// GroupIDs 让添加时就把新账号绑进指定分组（UpdateGrokAccount 复用本结构时忽略该字段，
+	// 编辑分组走账号编辑抽屉的 group_ids）。
+	GroupIDs json.RawMessage `json:"group_ids"`
 }
 
 // grokCredentialsFromRequest 校验请求并构造待入库的 credentials map。
@@ -40,7 +44,9 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 	}
 	credentials := map[string]interface{}{
 		"upstream_type": auth.UpstreamGrok,
-		"plan_type":     "api",
+		// 默认按 OAuth 订阅账号的免费档展示；API Key 账号无订阅档位，下方分支改回 "api"。
+		// billing 探针成功后 OAuth 账号会被纠正为真实套餐（free/SuperGrok/Heavy）。
+		"plan_type": "free",
 	}
 	if baseURL != "" {
 		credentials["base_url"] = baseURL
@@ -55,6 +61,7 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 			return nil, "", fmt.Errorf("API Key 是必填字段")
 		}
 		credentials["api_key"] = apiKey
+		credentials["plan_type"] = "api"
 		email = "xai-api-key"
 	case auth.GrokAuthKindOAuth, "":
 		creds, err := auth.ParseGrokAuthJSON([]byte(req.AuthJSON))
@@ -65,6 +72,7 @@ func grokCredentialsFromRequest(req *addGrokAccountReq) (map[string]interface{},
 		cred := creds[0]
 		if cred.AuthKind() == auth.GrokAuthKindAPIKey {
 			credentials["api_key"] = cred.APIKey
+			credentials["plan_type"] = "api"
 			email = "xai-api-key"
 			break
 		}
@@ -164,6 +172,12 @@ func (h *Handler) AddGrokAccount(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	// 分组校验放在建号之前：分组 ID 打错时不该留下一个没绑上分组的账号。
+	groupIDs, err := h.resolveImportGroupIDsJSON(ctx, req.GroupIDs)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	id, err := h.db.InsertAccountWithUpstream(ctx, name, "xai", auth.UpstreamGrok, credentials, req.ProxyURL)
 	if err != nil {
 		writeInternalError(c, err)
@@ -180,20 +194,14 @@ func (h *Handler) AddGrokAccount(c *gin.Context) {
 	h.store.AddAccount(acc)
 
 	// 异步 billing 探针：拉取套餐/周月额度，避免被 ChatGPT wham 误封
-	if h.probeUsage != nil {
-		go func(accountID int64) {
-			a := h.store.FindByID(accountID)
-			if a == nil {
-				return
-			}
-			probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
-			defer probeCancel()
-			_ = h.probeUsage(probeCtx, a)
-		}(id)
-	}
+	h.triggerGrokUsageProbe(id)
 
 	security.SecurityAuditLog("GROK_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d auth_kind=%s models=%d ip=%s", id, acc.GrokAuthKind(), len(models), c.ClientIP()))
-	c.JSON(http.StatusOK, gin.H{"message": "成功添加 Grok 账号", "id": id})
+	message := "成功添加 Grok 账号"
+	if err := h.bindImportedAccountGroups(ctx, []int64{id}, groupIDs); err != nil {
+		message += "，但分组绑定失败: " + err.Error()
+	}
+	c.JSON(http.StatusOK, gin.H{"message": message, "id": id, "group_ids": groupIDs})
 }
 
 // UpdateGrokAccount 更新 Grok 账号的可编辑配置（PATCH /api/admin/accounts/:id/grok）。
@@ -261,6 +269,13 @@ func (h *Handler) UpdateGrokAccount(c *gin.Context) {
 		credentials["api_key"] = apiKey
 	}
 	if err := h.db.UpdateCredentials(ctx, id, credentials); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	// proxy_url 是独立列，不在 credentials 里；UpdateCredentials 不会写它。
+	// 编辑是整体重写语义（空值即清空代理），须单独持久化，否则代理只落到内存
+	// store，重载 / 重启 / 后台刷新后被 DB 旧值覆盖，表现为"添加代理不生效"。
+	if err := h.db.UpdateAccountProxyURL(ctx, id, req.ProxyURL); err != nil {
 		writeInternalError(c, err)
 		return
 	}
@@ -342,18 +357,28 @@ func credentialStringValue(credentials map[string]interface{}, key string) strin
 	return ""
 }
 
+// grokPlanTypeOrDefault 取 credentials 里的 plan_type，缺失时回落到免费档
+// （现有写入路径都会显式设置，这里仅作防御性兜底）。
+func grokPlanTypeOrDefault(credentials map[string]interface{}) string {
+	if plan := strings.TrimSpace(credentialStringValue(credentials, "plan_type")); plan != "" {
+		return plan
+	}
+	return "free"
+}
+
 // grokAccountFromCredentials 从入库用的 credentials map 构造内存态 Account，
 // 供单条添加与批量文件导入共用。models/model_mapping/base_url/email 由调用方按需覆写。
 func grokAccountFromCredentials(id int64, credentials map[string]interface{}, proxyURL string) *auth.Account {
 	acc := &auth.Account{
-		DBID:              id,
-		ProxyURL:          proxyURL,
-		HealthTier:        auth.HealthTierHealthy,
-		UpstreamType:      auth.UpstreamGrok,
-		BaseURL:           strings.TrimRight(credentialStringValue(credentials, "base_url"), "/"),
-		ModelMapping:      credentialStringValue(credentials, "model_mapping"),
-		Email:             credentialStringValue(credentials, "email"),
-		PlanType:          "api",
+		DBID:         id,
+		ProxyURL:     proxyURL,
+		HealthTier:   auth.HealthTierHealthy,
+		UpstreamType: auth.UpstreamGrok,
+		BaseURL:      strings.TrimRight(credentialStringValue(credentials, "base_url"), "/"),
+		ModelMapping: credentialStringValue(credentials, "model_mapping"),
+		Email:        credentialStringValue(credentials, "email"),
+		// 与 credentials 保持一致（OAuth 默认 free、API Key 为 api）；不再写死 "api"。
+		PlanType:          grokPlanTypeOrDefault(credentials),
 		GrokClientID:      credentialStringValue(credentials, "grok_client_id"),
 		GrokTokenEndpoint: credentialStringValue(credentials, "grok_token_endpoint"),
 		GrokOIDCIssuer:    credentialStringValue(credentials, "grok_oidc_issuer"),
@@ -382,6 +407,8 @@ type batchImportGrokReq struct {
 	BaseURL  string   `json:"base_url"`
 	Models   []string `json:"models"`
 	ProxyURL string   `json:"proxy_url"`
+	// GroupIDs 让导入时就把新账号绑进指定分组；跳过的重复账号不受影响。
+	GroupIDs json.RawMessage `json:"group_ids"`
 }
 
 type grokBatchImportItem struct {
@@ -443,9 +470,15 @@ func (h *Handler) BatchImportGrokAccounts(c *gin.Context) {
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
 	defer cancel()
+	groupIDs, err := h.resolveImportGroupIDsJSON(ctx, req.GroupIDs)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	items := make([]grokBatchImportItem, 0, len(req.Files))
 	imported := 0
+	createdIDs := make([]int64, 0, len(req.Files))
 	for i, content := range req.Files {
 		item := grokBatchImportItem{}
 		fileReq := &addGrokAccountReq{
@@ -496,25 +529,21 @@ func (h *Handler) BatchImportGrokAccounts(c *gin.Context) {
 		item.ID = id
 		items = append(items, item)
 		imported++
+		createdIDs = append(createdIDs, id)
 
-		if h.probeUsage != nil {
-			go func(accountID int64) {
-				a := h.store.FindByID(accountID)
-				if a == nil {
-					return
-				}
-				probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
-				defer probeCancel()
-				_ = h.probeUsage(probeCtx, a)
-			}(id)
-		}
+		h.triggerGrokUsageProbe(id)
 	}
 
 	security.SecurityAuditLog("GROK_FILE_IMPORTED", fmt.Sprintf("total=%d imported=%d ip=%s", len(req.Files), imported, c.ClientIP()))
-	c.JSON(http.StatusOK, gin.H{
-		"total":    len(req.Files),
-		"imported": imported,
-		"failed":   len(req.Files) - imported,
-		"items":    items,
-	})
+	response := gin.H{
+		"total":     len(req.Files),
+		"imported":  imported,
+		"failed":    len(req.Files) - imported,
+		"items":     items,
+		"group_ids": groupIDs,
+	}
+	if err := h.bindImportedAccountGroups(ctx, createdIDs, groupIDs); err != nil {
+		response["group_bind_error"] = err.Error()
+	}
+	c.JSON(http.StatusOK, response)
 }

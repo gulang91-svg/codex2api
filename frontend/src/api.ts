@@ -25,6 +25,9 @@ import type {
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
+  APIKeyAccountStat,
+  APIKeyScopeUsageItem,
+  APIKeyScopeSummaryItem,
   AccountsResponse,
   ChartAggregation,
   CreateAccountResponse,
@@ -401,7 +404,13 @@ export const api = {
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
-  getAccounts: () => request<AccountsResponse>('/accounts'),
+  // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
+  getAccounts: (params: { channel?: 'codex' | 'grok' } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.channel) searchParams.set('channel', params.channel)
+    const qs = searchParams.toString()
+    return request<AccountsResponse>(`/accounts${qs ? `?${qs}` : ''}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
@@ -513,6 +522,10 @@ export const api = {
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ message: string; deleted: number; success: number; failed: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchRefreshAccounts: (ids: number[]) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
     const search = new URLSearchParams()
     if (typeof days === 'number') search.set('days', String(days))
@@ -597,6 +610,15 @@ export const api = {
       qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
     )
   },
+  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyAccountStat[] }>(
+      qs ? `/usage/api-keys/${id}/accounts?${qs}` : `/usage/api-keys/${id}/accounts`,
+    )
+  },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
@@ -648,6 +670,18 @@ export const api = {
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // 分组 / 账号维度限额的当前用量（issue #439）。
+  getAPIKeyScopeUsage: (id: number) =>
+    request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
+  // 列表页用的全量概览：一次拿到所有 Key 的 scope 预算占比。
+  getAPIKeysScopeSummary: () =>
+    request<{ summary: Record<string, APIKeyScopeSummaryItem[]> }>('/keys-scope-summary'),
+  // 重置某条 scope 的累计额度（累计额度不随时间回落，必须显式重置）。
+  resetAPIKeyScopeQuota: (id: number, data: { scope_type: 'group' | 'account'; scope_id: number }) =>
+    request<MessageResponse>(`/keys/${id}/scope-quota/reset`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {
     const sp = new URLSearchParams()
     if (params.q) sp.set('q', params.q)
@@ -796,6 +830,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  cleanGrokBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
+  cleanGrokError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))

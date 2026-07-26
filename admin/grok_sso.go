@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,6 +22,8 @@ type importGrokSSOReq struct {
 	BaseURL  string   `json:"base_url"`
 	Models   []string `json:"models"`
 	ProxyURL string   `json:"proxy_url"`
+	// GroupIDs 让导入时就把新账号绑进指定分组；跳过的重复账号不受影响。
+	GroupIDs json.RawMessage `json:"group_ids"`
 }
 
 type grokSSOImportItem struct {
@@ -32,8 +35,9 @@ type grokSSOImportItem struct {
 }
 
 const (
-	grokSSOImportMaxTokens  = 50
-	grokSSOImportConcurrent = 4
+	grokSSOImportMaxTokens = 50
+	// SSO 每条要跑完整个 device flow（多次往返），并发略高于 refresh 以缩短总墙钟。
+	grokSSOImportConcurrent = 6
 	grokSSOImportPerToken   = 75 * time.Second
 )
 
@@ -62,6 +66,14 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 			return
 		}
 	}
+	// 分组校验放在导入之前：分组 ID 打错时不该留下一批没绑上分组的账号。
+	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	groupIDs, err := h.resolveImportGroupIDsJSON(groupCtx, req.GroupIDs)
+	groupCancel()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	seeds, err := auth.ParseGrokSSOTokens([]byte(req.Tokens))
 	if err != nil {
@@ -77,6 +89,18 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 	items := make([]grokSSOImportItem, len(seeds))
 	sem := make(chan struct{}, grokSSOImportConcurrent)
 	var wg sync.WaitGroup
+	// 按 subject 去重：预载已有 Grok 账号，锁保护并发读写，避免重复导入同一账号。
+	var mu sync.Mutex
+	seenSubjects := make(map[string]struct{})
+	if h.store != nil {
+		for _, acc := range h.store.Accounts() {
+			if acc.IsGrokAPI() {
+				if sub := strings.TrimSpace(acc.GrokUserID()); sub != "" {
+					seenSubjects[sub] = struct{}{}
+				}
+			}
+		}
+	}
 	for i, seed := range seeds {
 		wg.Add(1)
 		go func(idx int, s auth.GrokSSOSeed) {
@@ -94,6 +118,19 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 				items[idx] = item
 				return
 			}
+
+			mu.Lock()
+			if result.Subject != "" {
+				if _, dup := seenSubjects[result.Subject]; dup {
+					mu.Unlock()
+					item.Error = "账号已存在，已跳过"
+					items[idx] = item
+					return
+				}
+				seenSubjects[result.Subject] = struct{}{}
+			}
+			mu.Unlock()
+
 			name := strings.TrimSpace(s.Name)
 			if utf8.RuneCountInString(name) > 100 {
 				name = string([]rune(name)[:100])
@@ -126,17 +163,7 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 			items[idx] = item
 
 			// 异步 billing 探针，与其它添加路径一致
-			if h.probeUsage != nil {
-				go func(accountID int64) {
-					acc := h.store.FindByID(accountID)
-					if acc == nil {
-						return
-					}
-					probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
-					defer probeCancel()
-					_ = h.probeUsage(probeCtx, acc)
-				}(id)
-			}
+			h.triggerGrokUsageProbe(id)
 		}(i, seed)
 	}
 	wg.Wait()
@@ -148,12 +175,17 @@ func (h *Handler) ImportGrokSSO(c *gin.Context) {
 		}
 	}
 	security.SecurityAuditLog("GROK_SSO_IMPORTED", fmt.Sprintf("total=%d imported=%d ip=%s", len(seeds), imported, c.ClientIP()))
-	c.JSON(http.StatusOK, gin.H{
-		"total":    len(seeds),
-		"imported": imported,
-		"failed":   len(seeds) - imported,
-		"items":    items,
-	})
+	response := gin.H{
+		"total":     len(seeds),
+		"imported":  imported,
+		"failed":    len(seeds) - imported,
+		"items":     items,
+		"group_ids": groupIDs,
+	}
+	if err := h.bindImportedAccountGroups(c.Request.Context(), importedGrokAccountIDs(items), groupIDs); err != nil {
+		response["group_bind_error"] = err.Error()
+	}
+	c.JSON(http.StatusOK, response)
 }
 
 // importGrokRefreshReq 是 refresh_token 批量导入的请求体（Tokens 每行一个 refresh_token）。
@@ -162,6 +194,8 @@ type importGrokRefreshReq struct {
 	BaseURL  string   `json:"base_url"`
 	Models   []string `json:"models"`
 	ProxyURL string   `json:"proxy_url"`
+	// GroupIDs 让导入时就把新账号绑进指定分组；跳过的重复账号不受影响。
+	GroupIDs json.RawMessage `json:"group_ids"`
 }
 
 const (
@@ -211,6 +245,14 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
 			return
 		}
+	}
+	// 分组校验放在导入之前：分组 ID 打错时不该留下一批没绑上分组的账号。
+	groupCtx, groupCancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	groupIDs, err := h.resolveImportGroupIDsJSON(groupCtx, req.GroupIDs)
+	groupCancel()
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
 	}
 
 	tokens := parseTokenLines(req.Tokens)
@@ -300,17 +342,7 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 			}
 			items[idx] = item
 
-			if h.probeUsage != nil {
-				go func(accountID int64) {
-					a := h.store.FindByID(accountID)
-					if a == nil {
-						return
-					}
-					probeCtx, probeCancel := context.WithTimeout(context.Background(), 25*time.Second)
-					defer probeCancel()
-					_ = h.probeUsage(probeCtx, a)
-				}(id)
-			}
+			h.triggerGrokUsageProbe(id)
 		}(i, rt)
 	}
 	wg.Wait()
@@ -322,10 +354,26 @@ func (h *Handler) ImportGrokRefreshTokens(c *gin.Context) {
 		}
 	}
 	security.SecurityAuditLog("GROK_REFRESH_IMPORTED", fmt.Sprintf("total=%d imported=%d ip=%s", len(tokens), imported, c.ClientIP()))
-	c.JSON(http.StatusOK, gin.H{
-		"total":    len(tokens),
-		"imported": imported,
-		"failed":   len(tokens) - imported,
-		"items":    items,
-	})
+	response := gin.H{
+		"total":     len(tokens),
+		"imported":  imported,
+		"failed":    len(tokens) - imported,
+		"items":     items,
+		"group_ids": groupIDs,
+	}
+	if err := h.bindImportedAccountGroups(c.Request.Context(), importedGrokAccountIDs(items), groupIDs); err != nil {
+		response["group_bind_error"] = err.Error()
+	}
+	c.JSON(http.StatusOK, response)
+}
+
+// importedGrokAccountIDs 从导入结果里挑出真正新建的账号 ID（跳过重复与失败的条目）。
+func importedGrokAccountIDs(items []grokSSOImportItem) []int64 {
+	ids := make([]int64, 0, len(items))
+	for _, item := range items {
+		if item.OK && item.ID > 0 {
+			ids = append(ids, item.ID)
+		}
+	}
+	return ids
 }

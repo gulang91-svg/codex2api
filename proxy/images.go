@@ -1046,6 +1046,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1131,11 +1132,16 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 }
 
 func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
+	if err := h.captureSignedMultipartIngress(c); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 	form, err := c.MultipartForm()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if prompt == "" {
@@ -1156,26 +1162,6 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if len(imageFiles) > MaxImageEditInputCount {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(imageFiles), MaxImageEditInputCount), "type": "invalid_request_error"}})
 		return
-	}
-
-	images := make([]string, 0, len(imageFiles))
-	for _, fileHeader := range imageFiles {
-		dataURL, err := multipartFileToDataURL(fileHeader)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		images = append(images, dataURL)
-	}
-
-	var maskDataURL string
-	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
-		dataURL, err := multipartFileToDataURL(maskFiles[0])
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		maskDataURL = dataURL
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
@@ -1209,6 +1195,29 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+
+	// Multipart parsing may have used bounded temporary storage before the
+	// prompt field was known, but image bytes must not be decoded or expanded to
+	// Base64 until the current-user prompt has passed the guard.
+	images := make([]string, 0, len(imageFiles))
+	for _, fileHeader := range imageFiles {
+		dataURL, err := multipartFileToDataURL(fileHeader)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, dataURL)
+	}
+
+	var maskDataURL string
+	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		dataURL, err := multipartFileToDataURL(maskFiles[0])
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		maskDataURL = dataURL
+	}
 	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
 	if !ok {
 		return
@@ -1219,6 +1228,28 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
+}
+
+// captureSignedMultipartIngress preserves the exact wire body for NewAPI HMAC
+// verification, then restores it for net/http multipart parsing. It is only
+// enabled when signed NewAPI audit forwarding is configured, avoiding an
+// extra full-body copy for ordinary image uploads.
+func (h *Handler) captureSignedMultipartIngress(c *gin.Context) error {
+	if h == nil || h.store == nil || c == nil || c.Request == nil {
+		return nil
+	}
+	cfg := h.promptFilterConfigForRequest(c)
+	if !cfg.Advanced.NewAPI.Enabled || strings.TrimSpace(c.GetHeader("X-NewAPI-Signature")) == "" {
+		return nil
+	}
+	body, err := readRawRequestBody(c)
+	if err != nil {
+		return err
+	}
+	setIngressRequestBodyIfAbsent(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
+	return nil
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -1249,6 +1280,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1384,13 +1416,15 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
-	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+// nextImageAccount 先在 plus 及以上套餐的账号里挑，挑不到再放开到全部账号。
+// 两层都要过 scope 预算闸门（issue #439），否则回退层会绕过预算限制。
+func (h *Handler) nextImageAccount(c *gin.Context, apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
+	preferredFilter := h.applyScopeBudgetFilter(c, h.withModelCooldownFilter(model, imagePreferredAccountFilter))
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, h.withModelCooldownFilter(model, nil)))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -1403,6 +1437,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 
 	apiKeyID := requestAPIKeyID(c)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0
@@ -1423,12 +1459,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
+		account, stickyProxyURL := h.nextImageAccount(c, apiKeyID, excludeAccounts, requestModel)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.applyScopeBudgetFilter(c, h.withModelCooldownFilter(requestModel, nil)))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1436,6 +1476,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			}
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
@@ -1876,7 +1917,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := h.newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
