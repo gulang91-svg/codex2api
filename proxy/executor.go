@@ -439,6 +439,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// 上游不接受的层级会原样发出并触发 400，这里补一次净化兜底。用量日志的
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
+		requestBody = applyContextFastModePolicy(ctx, requestBody)
 	}
 	wantWebsocket := CurrentRuntimeSettings().CodexForceWebsocket
 	if len(useWebsocket) > 0 {

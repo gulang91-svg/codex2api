@@ -91,6 +91,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
 	}
+	rawBody = applyAnthropicAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	if len(rawBody) == 0 {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")

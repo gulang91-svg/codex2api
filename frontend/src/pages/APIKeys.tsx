@@ -62,6 +62,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Zap,
   Waypoints,
   Trash2,
   XCircle,
@@ -111,12 +112,14 @@ interface LimitsFormState {
   tokenLimit7dUnit: TokenLimitUnit;
   tokenLimit30d: string;
   tokenLimit30dUnit: TokenLimitUnit;
+  fastModePolicy: FastModePolicy;
   imageGenerationPolicy: ImageGenerationPolicy;
   upstreamChannel: UpstreamChannel;
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
 type UpstreamChannel = "auto" | "codex" | "grok";
+type FastModePolicy = "disabled" | "passthrough" | "forced";
 
 // Grok 账号都未声明模型时的下拉兜底(与 Grok 账号页测试模型列表一致)。
 const DEFAULT_GROK_MODEL_OPTIONS = [
@@ -152,6 +155,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
   tokenLimit30dUnit: "token",
+  fastModePolicy: "disabled",
   imageGenerationPolicy: "allow",
   upstreamChannel: "auto",
 };
@@ -1798,6 +1802,21 @@ export default function APIKeys() {
             </div>
 
             <FormField
+              label={t("apiKeys.limits.fastMode")}
+              icon={<Zap className="size-3.5" />}
+              as="div"
+            >
+              <FastModePicker
+                value={createForm.limits.fastModePolicy}
+                onChange={(fastModePolicy) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, fastModePolicy },
+                  })
+                }
+              />
+            </FormField>
+
+            <FormField
               label={t("apiKeys.limits.upstreamChannel")}
               icon={<Waypoints className="size-3.5" />}
               as="div"
@@ -1989,6 +2008,21 @@ export default function APIKeys() {
                       />
                     </FormField>
                   </div>
+
+                  <FormField
+                    label={t("apiKeys.limits.fastMode")}
+                    icon={<Zap className="size-3.5" />}
+                    as="div"
+                  >
+                    <FastModePicker
+                      value={editForm.limits.fastModePolicy}
+                      onChange={(fastModePolicy) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, fastModePolicy },
+                        })
+                      }
+                    />
+                  </FormField>
 
                   <FormField
                     label={t("apiKeys.limits.upstreamChannel")}
@@ -2230,6 +2264,12 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit7dUnit: token7d.unit,
     tokenLimit30d: token30d.value,
     tokenLimit30dUnit: token30d.unit,
+    fastModePolicy:
+      limits.disable_fast_mode === true
+        ? "disabled"
+        : limits.force_fast_mode === true
+          ? "forced"
+          : "passthrough",
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
@@ -2240,6 +2280,42 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
 
 // UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
 // 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
+function FastModePicker({
+  value,
+  onChange,
+}: {
+  value: FastModePolicy;
+  onChange: (value: FastModePolicy) => void;
+}) {
+  const { t } = useTranslation();
+  const options: FastModePolicy[] = ["disabled", "passthrough", "forced"];
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+        {options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            onClick={() => onChange(option)}
+            aria-pressed={value === option}
+            className={cn(
+              "rounded-lg px-2 py-2 text-sm font-semibold transition-all",
+              value === option
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t(`apiKeys.limits.fastModeOption.${option}`)}
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {t(`apiKeys.limits.fastModeHint.${value}`)}
+      </p>
+    </div>
+  );
+}
+
 function UpstreamChannelPicker({
   value,
   onChange,
@@ -2365,6 +2441,8 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     token_limit_5h: parseTokenLimit(form.tokenLimit5h, form.tokenLimit5hUnit),
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
+    disable_fast_mode: form.fastModePolicy === "disabled" || undefined,
+    force_fast_mode: form.fastModePolicy === "forced" || undefined,
     image_generation_policy:
       form.imageGenerationPolicy === "allow"
         ? undefined

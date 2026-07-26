@@ -6198,6 +6198,8 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit5h:           maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
+		DisableFastMode:        in.DisableFastMode,
+		ForceFastMode:          in.ForceFastMode && !in.DisableFastMode,
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,

@@ -1592,6 +1592,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
 		c.Set(contextAPIKeyRow, apiKeyRow)
 		c.Set("apiKey", key)
+		attachAPIKeyFastModePolicy(c, apiKeyRow.Limits.DisableFastMode, apiKeyRow.Limits.ForceFastMode)
 		c.Next()
 	}
 }
@@ -1804,6 +1805,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	bodyReadDone := time.Now()
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
 	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
@@ -3010,6 +3013,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -3538,6 +3543,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Failed to read request body", api.ErrorTypeInvalidRequest))
 		return
 	}
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)

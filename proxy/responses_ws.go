@@ -139,6 +139,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)

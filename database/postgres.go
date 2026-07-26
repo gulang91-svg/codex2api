@@ -1073,6 +1073,11 @@ type APIKeyLimits struct {
 	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
 	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
 	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
+	// DisableFastMode 为 true 时，该 Key 不允许请求 fast/priority 服务等级。
+	DisableFastMode bool `json:"disable_fast_mode,omitempty"`
+	// ForceFastMode 为 true 时，该 Key 的所有请求都强制使用 fast/priority。
+	// 与 DisableFastMode 互斥；归一化时 DisableFastMode 优先。
+	ForceFastMode bool `json:"force_fast_mode,omitempty"`
 	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
 	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
 	// 保留为向后兼容字段：新配置改用 ImageGenerationPolicy；未设 policy 时该 bool=true
@@ -1143,6 +1148,8 @@ func (l APIKeyLimits) IsZero() bool {
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 &&
+		!l.DisableFastMode &&
+		!l.ForceFastMode &&
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&
@@ -2552,7 +2559,7 @@ func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
 
 // UsageLogInput 日志写入参数
 type UsageLogInput struct {
-	AccountID            int64
+	AccountID int64
 	// Channel 是处理该请求的上游渠道（codex/grok），写入时固化，空值表示未知。
 	Channel              string
 	ClientIP             string
