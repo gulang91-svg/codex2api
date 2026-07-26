@@ -3614,6 +3614,17 @@
       "planAllowHint": "选中后,该密钥仅调度命中所选套餐的账号(可多选);不选表示不限套餐。",
       "disableImageGeneration": "禁止生图",
       "disableImageGenerationHint": "开启后,该密钥禁止访问生图模型(gpt-image-*)与生图工具链路(image_generation 工具、/v1/images 端点),命中一律返回 403。默认关闭。",
+      "fastMode": "Fast 模式",
+      "fastModeOption": {
+        "disabled": "禁用",
+        "passthrough": "按请求",
+        "forced": "强制 Fast"
+      },
+      "fastModeHint": {
+        "disabled": "移除客户端的 fast/priority 参数，始终按普通模式发送。",
+        "passthrough": "不强制：客户端请求 Fast 时透传，否则使用普通模式。",
+        "forced": "无论客户端是否请求，所有请求都强制使用 Fast/Priority。"
+      },
       "imageGenerationPolicy": "图片工具策略",
       "imageGenerationPolicyAllow": "允许",
       "imageGenerationPolicyStrip": "剥离后作为文本请求继续",
