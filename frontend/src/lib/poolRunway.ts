@@ -8,7 +8,7 @@
  */
 
 import type { AccountRow } from '../types'
-import { MAX_ACCOUNT_CONCURRENCY } from './accountConcurrency'
+import { MAX_ACCOUNT_CONCURRENCY } from './accountConcurrency.ts'
 
 export type RecoveryWindow = '5h' | '7d'
 export type RiskLevel = 'low' | 'medium' | 'high'

@@ -1,5 +1,29 @@
 # Laoliu Codex2API Patches
 
+## 2026-07-28
+
+- Upstream tag: `v2.6.6`
+- Upstream commit: `76b2f38d0e1ed379017b25eeeaafa1a0dc407df0`
+- Integration: merged the official release into the Laoliu branch without
+  replacing the local image, fast-mode, concurrency, proxy, logging, pricing,
+  and admin customizations.
+- Compatibility fix: preserve both the upstream no-affinity account-group
+  routing fields and the local per-key fast-mode policy fields.
+- Reliability fix: make the legacy Responses-success recovery path robust when
+  the platform clock returns the same timestamp as the preceding rate limit.
+- Tooling fix: make the pool-runway TypeScript import work in both the Node test
+  runner and the Vite production build.
+
+Verification:
+
+```sh
+go test ./...
+cd frontend
+npm run typecheck
+npm test
+npm run build
+```
+
 ## 2026-07-11
 
 - Upstream repository: `james-6-23/codex2api`

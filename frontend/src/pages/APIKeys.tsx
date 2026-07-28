@@ -105,6 +105,7 @@ interface LimitsFormState {
   modelAllow: string[];
   modelDeny: string[];
   planAllow: string[];
+  noAffinityGroupIds: number[];
   rpm: string;
   rpd: string;
   maxConcurrency: string;
@@ -189,6 +190,7 @@ const emptyLimitsForm: LimitsFormState = {
   modelAllow: [],
   modelDeny: [],
   planAllow: [],
+  noAffinityGroupIds: [],
   rpm: "",
   rpd: "",
   maxConcurrency: "",
@@ -2219,6 +2221,28 @@ export default function APIKeys() {
                       {t("apiKeys.allowedGroupsHint")}
                     </p>
                   </FormField>
+
+                  <FormField
+                    label={t("apiKeys.noAffinityGroupsLabel")}
+                    icon={<Waypoints className="size-3.5" />}
+                    as="div"
+                  >
+                    <GroupMultiSelect
+                      groups={groups}
+                      value={editForm.limits.noAffinityGroupIds}
+                      onChange={(noAffinityGroupIds) =>
+                        updateEditForm({
+                          limits: { ...editForm.limits, noAffinityGroupIds },
+                        })
+                      }
+                      allLabel={t("apiKeys.noAffinityGroupsDisabled")}
+                      placeholder={t("apiKeys.noAffinityGroupsPlaceholder")}
+                      emptyLabel={t("accounts.groupsNone")}
+                    />
+                    <p className="mt-1.5 text-xs text-muted-foreground">
+                      {t("apiKeys.noAffinityGroupsHint")}
+                    </p>
+                  </FormField>
                 </>
               ) : (
                 <LimitsEditor
@@ -2368,6 +2392,9 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     modelAllow: Array.isArray(limits.model_allow) ? limits.model_allow : [],
     modelDeny: Array.isArray(limits.model_deny) ? limits.model_deny : [],
     planAllow: Array.isArray(limits.plan_allow) ? limits.plan_allow : [],
+    noAffinityGroupIds: Array.isArray(limits.no_affinity_group_ids)
+      ? limits.no_affinity_group_ids
+      : [],
     rpm: limits.rpm && limits.rpm > 0 ? String(limits.rpm) : "",
     rpd: limits.rpd && limits.rpd > 0 ? String(limits.rpd) : "",
     maxConcurrency:
@@ -2609,6 +2636,7 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     model_allow: form.modelAllow.map((m) => m.trim()).filter(Boolean),
     model_deny: form.modelDeny.map((m) => m.trim()).filter(Boolean),
     plan_allow: form.planAllow.map((p) => p.trim()).filter(Boolean),
+    no_affinity_group_ids: form.noAffinityGroupIds,
     rpm: intNum(form.rpm),
     rpd: intNum(form.rpd),
     max_concurrency: intNum(form.maxConcurrency),
