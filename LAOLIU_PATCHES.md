@@ -1,5 +1,28 @@
 # Laoliu Codex2API Patches
 
+## 2026-07-29
+
+- Upstream tag: `v2.6.7`
+- Upstream commit: `4aa58cb6d3c7fe6fb4eece7d870ebdc44d0def96`
+- Integration: merged the official release into the Laoliu branch while
+  retaining the local image, fast-mode, concurrency, proxy, logging, pricing,
+  and admin customizations.
+- Upstream additions retained: weak-network WebSocket mode, lower streaming
+  memory retention, provider-qualified model names, structured batch operation
+  results, proxy pagination, and the `0.144.1` minimum Codex CLI baseline.
+- Database migration: add `codex_ws_weak_network_mode` with a default of
+  `false`; existing deployments remain behaviorally unchanged until enabled.
+
+Verification:
+
+```sh
+go test ./...
+cd frontend
+npm run typecheck
+npm test
+npm run build
+```
+
 ## 2026-07-28
 
 - Upstream tag: `v2.6.6`
