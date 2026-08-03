@@ -1886,6 +1886,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		c.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKeyRow.Key))
 		c.Set(contextAPIKeyRow, apiKeyRow)
 		c.Set("apiKey", key)
+		attachAPIKeyFastModePolicy(c, apiKeyRow.Limits.DisableFastMode, apiKeyRow.Limits.ForceFastMode)
 		if h.enforceRequiredNewAPIIdentityAtIngress(c) {
 			c.Abort()
 			return
@@ -2138,6 +2139,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 	bodyReadDone := time.Now()
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
@@ -3461,6 +3464,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	h.capturePromptRequestIngress(c, rawBody)
 	cacheRequestCompactionMeta(c, requestCompactionMetaForHTTP(c, rawBody))
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
@@ -4020,6 +4025,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	rawBody = applyAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)

@@ -68,6 +68,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Zap,
   Waypoints,
   Trash2,
   XCircle,
@@ -122,6 +123,7 @@ interface LimitsFormState {
   tokenLimit30dUnit: TokenLimitUnit;
   tokenLimitDaily: string;
   tokenLimitDailyUnit: TokenLimitUnit;
+  fastModePolicy: FastModePolicy;
   imageGenerationPolicy: ImageGenerationPolicy;
   upstreamChannel: UpstreamChannel;
   scopeLimits: ScopeLimitFormState[];
@@ -129,6 +131,7 @@ interface LimitsFormState {
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
 type UpstreamChannel = "auto" | "codex" | "grok";
+type FastModePolicy = "disabled" | "passthrough" | "forced";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -204,6 +207,7 @@ const emptyLimitsForm: LimitsFormState = {
   tokenLimit5hUnit: "token",
   tokenLimitDaily: "",
   tokenLimitDailyUnit: "token",
+  fastModePolicy: "disabled",
   tokenLimit7d: "",
   tokenLimit7dUnit: "token",
   tokenLimit30d: "",
@@ -1999,6 +2003,21 @@ export default function APIKeys() {
               />
             </FormField>
 
+            <FormField
+              label={t("apiKeys.limits.fastMode")}
+              icon={<Zap className="size-3.5" />}
+              as="div"
+            >
+              <FastModePicker
+                value={createForm.limits.fastModePolicy}
+                onChange={(fastModePolicy) =>
+                  updateCreateForm({
+                    limits: { ...createForm.limits, fastModePolicy },
+                  })
+                }
+              />
+            </FormField>
+
             <div className="grid gap-4 sm:grid-cols-2">
               <FormField
                 label={t("apiKeys.quotaLimitLabel")}
@@ -2206,6 +2225,21 @@ export default function APIKeys() {
                         }
                         options={expireOptions}
                         compact
+                      />
+                    </FormField>
+
+                    <FormField
+                      label={t("apiKeys.limits.fastMode")}
+                      icon={<Zap className="size-3.5" />}
+                      as="div"
+                    >
+                      <FastModePicker
+                        value={editForm.limits.fastModePolicy}
+                        onChange={(fastModePolicy) =>
+                          updateEditForm({
+                            limits: { ...editForm.limits, fastModePolicy },
+                          })
+                        }
                       />
                     </FormField>
                     {editForm.expireMode === "custom" ? (
@@ -2455,6 +2489,12 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     tokenLimit30dUnit: token30d.unit,
     tokenLimitDaily: tokenDaily.value,
     tokenLimitDailyUnit: tokenDaily.unit,
+    fastModePolicy:
+      limits.disable_fast_mode === true
+        ? "disabled"
+        : limits.force_fast_mode === true
+          ? "forced"
+          : "passthrough",
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     upstreamChannel:
       limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
@@ -2514,6 +2554,42 @@ function scopeLimitRowHasLimit(row: ScopeLimitFormState): boolean {
 
 // UpstreamChannelPicker 是创建/编辑 Key 时的上游渠道三段选择（自动/Codex/Grok）。
 // 渠道决定 Key 的调度账号池，作为一级表单字段展示（不藏在高级限制里）。
+function FastModePicker({
+  value,
+  onChange,
+}: {
+  value: FastModePolicy;
+  onChange: (value: FastModePolicy) => void;
+}) {
+  const { t } = useTranslation();
+  const options: FastModePolicy[] = ["disabled", "passthrough", "forced"];
+  return (
+    <div>
+      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+        {options.map((option) => (
+          <button
+            key={option}
+            type="button"
+            onClick={() => onChange(option)}
+            aria-pressed={value === option}
+            className={cn(
+              "rounded-lg px-2 py-2 text-sm font-semibold transition-all",
+              value === option
+                ? "bg-background text-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {t(`apiKeys.limits.fastModeOption.${option}`)}
+          </button>
+        ))}
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {t(`apiKeys.limits.fastModeHint.${value}`)}
+      </p>
+    </div>
+  );
+}
+
 function UpstreamChannelPicker({
   value,
   onChange,
@@ -2642,6 +2718,8 @@ function limitsFormToPayload(form: LimitsFormState): APIKeyLimits {
     token_limit_7d: parseTokenLimit(form.tokenLimit7d, form.tokenLimit7dUnit),
     token_limit_30d: parseTokenLimit(form.tokenLimit30d, form.tokenLimit30dUnit),
     token_limit_daily: parseTokenLimit(form.tokenLimitDaily, form.tokenLimitDailyUnit),
+    disable_fast_mode: form.fastModePolicy === "disabled" || undefined,
+    force_fast_mode: form.fastModePolicy === "forced" || undefined,
     image_generation_policy:
       form.imageGenerationPolicy === "allow"
         ? undefined
