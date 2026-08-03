@@ -81,7 +81,7 @@ var (
 			LongOutputPricePerMToken:    45.0,
 			LongCacheReadPricePerMToken: 1.0,
 		}},
-		// gpt-5.6-terra: 2026-07-30 官方降价 20%（$2/$12，原 $2.5/$15），priority 2×；
+		// gpt-5.6-terra: 2026-07-30 official price reduction to $2/$12, with priority at 2x;
 		// 独立规范键，便于定价页单独覆盖，不与 gpt-5.4 互相污染。
 		{model: "gpt-5.6-terra", pricing: ModelPricing{
 			InputPricePerMToken:                 2.0,
