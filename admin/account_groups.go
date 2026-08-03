@@ -21,6 +21,7 @@ import (
 const (
 	maxAccountGroups            = 64
 	maxAccountGroupNameRuneSize = 80
+	maxAccountConcurrency       = 200
 )
 
 type accountGroupResponse struct {
@@ -127,7 +128,7 @@ func parseAccountGroupBaseConcurrencyOverride(raw json.RawMessage) (database.Opt
 		return database.OptionalNullInt64{}, errors.New("base_concurrency_override 必须是整数或 null")
 	}
 	// 最小 1，无上限（与全局 max_concurrency / 账号级覆盖一致）
-	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, math.MaxInt64)
+	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, maxAccountConcurrency)
 }
 
 func (h *Handler) CreateAccountGroup(c *gin.Context) {

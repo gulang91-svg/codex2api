@@ -8,7 +8,8 @@
  */
 
 import type { AccountPressureForecastAnalysis, AccountRow } from '../types'
-import { MAX_ACCOUNT_CONCURRENCY } from './accountConcurrency'
+// @ts-ignore Node's strip-types test runner needs the explicit extension.
+import { MAX_ACCOUNT_CONCURRENCY } from './accountConcurrency.ts'
 
 export type RecoveryWindow = '5h' | '7d'
 export type RiskLevel = 'low' | 'medium' | 'high'

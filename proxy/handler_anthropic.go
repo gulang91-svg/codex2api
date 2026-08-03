@@ -108,6 +108,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		return
 	}
 	h.capturePromptRequestIngress(c, rawBody)
+	rawBody = applyAnthropicAPIKeyFastModePolicy(c, rawBody)
+	setRawRequestBody(c, rawBody)
 
 	if len(rawBody) == 0 {
 		rejectAnthropicMessagesRequest(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")

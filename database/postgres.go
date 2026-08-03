@@ -1510,6 +1510,10 @@ type APIKeyLimits struct {
 	TokenLimit7d       int64   `json:"token_limit_7d,omitempty"`
 	TokenLimit30d      int64   `json:"token_limit_30d,omitempty"`
 	TokenLimitDaily    int64   `json:"token_limit_daily,omitempty"`
+	// DisableFastMode prevents this key from requesting fast/priority upstream service.
+	DisableFastMode bool `json:"disable_fast_mode,omitempty"`
+	// ForceFastMode makes this key use fast/priority upstream service when supported.
+	ForceFastMode bool `json:"force_fast_mode,omitempty"`
 	// DisableImageGeneration 为 true 时，该 Key 禁止访问生图模型(gpt-image-*)与
 	// 生图工具链路(image_generation 工具 / /v1/images 端点)，命中一律 403。
 	// 保留为向后兼容字段：新配置改用 ImageGenerationPolicy；未设 policy 时该 bool=true
@@ -1586,6 +1590,7 @@ func (l APIKeyLimits) IsZero() bool {
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 && l.CostLimitDaily == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0 && l.TokenLimitDaily == 0 &&
 		len(l.ScopeLimits) == 0 &&
+		!l.DisableFastMode && !l.ForceFastMode &&
 		!l.DisableImageGeneration &&
 		!l.AutoCompactOnOverflow &&
 		l.ResolveImageGenerationPolicy() == ImageGenerationPolicyAllow &&

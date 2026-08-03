@@ -1476,7 +1476,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	// 基础并发覆盖：最小 1，无上限（与全局 max_concurrency 一致）
-	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, math.MaxInt64)
+	baseConcurrencyOverride, err := parseOptionalIntegerField(req.BaseConcurrencyOverride, "base_concurrency_override", 1, maxAccountConcurrency)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -7316,6 +7316,8 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit7d:           maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:          maxInt64(in.TokenLimit30d, 0),
 		TokenLimitDaily:        maxInt64(in.TokenLimitDaily, 0),
+		DisableFastMode:        in.DisableFastMode,
+		ForceFastMode:          in.ForceFastMode && !in.DisableFastMode,
 		DisableImageGeneration: in.DisableImageGeneration,
 		ImageGenerationPolicy:  sanitizeImageGenerationPolicy(in),
 		AutoCompactOnOverflow:  in.AutoCompactOnOverflow,
