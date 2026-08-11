@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 const componentSource = readFileSync(new URL('../components/PromptFilterNewAPIBindings.tsx', import.meta.url), 'utf8')
-const pageSource = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
+const pageSource = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 const apiSource = readFileSync(new URL('../api.ts', import.meta.url), 'utf8')
 const typesSource = readFileSync(new URL('../types.ts', import.meta.url), 'utf8')
 

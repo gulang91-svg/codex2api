@@ -2,8 +2,8 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-const promptFilterSource = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8')
-const settingsSource = readFileSync(new URL('../pages/Settings.tsx', import.meta.url), 'utf8')
+const promptFilterSource = readFileSync(new URL('../pages/PromptFilter.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
+const settingsSource = readFileSync(new URL('../pages/Settings.tsx', import.meta.url), 'utf8').replace(/\r\n/g, '\n')
 const apiSource = readFileSync(new URL('../api.ts', import.meta.url), 'utf8')
 const typesSource = readFileSync(new URL('../types.ts', import.meta.url), 'utf8')
 
