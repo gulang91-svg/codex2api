@@ -51,3 +51,18 @@ same ceiling. The global setting remains governed by the official runtime behavi
 go test ./proxy ./admin ./internal/imageproc
 go test ./...
 ```
+
+### Production deployment
+
+- Deployed image: `codex2api:laoliu-v2.7.4`
+- Image ID: `sha256:2b93d1e4eeb354ede310fa9c402c3d9099f4d5ef37452d22738854ff174d4731`
+- Source archive SHA256: `218c3b9016f0e126836012c6a99523812d78ef0fe8529002f9752309c0b7a9df`
+- Pre-upgrade backup: `/opt/backups/codex2api-before-v274-20260811-133530`
+- Frontend verification: 103/103 tests passed, typecheck passed, production build passed.
+- Backend verification: all packages passed except the official upstream
+  `TestPromptFilterAuditQueueCloseRejectsConcurrentEnqueue` timing test, which is
+  intermittent under repeated execution and is unchanged from `official/main`.
+- A restored PostgreSQL backup and isolated Redis instance were used for migration and
+  startup validation before the production database was touched.
+- Production checks passed for `/health`, `/admin/`, unauthenticated rejection, and an
+  authenticated `/v1/models` request through `sub3.laoliu.co`.
